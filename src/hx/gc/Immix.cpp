@@ -91,7 +91,7 @@ enum { gAlwaysMove = false };
 
 #include <hx/QuickVec.h>
 
-// #define HXCPP_GC_BIG_BLOCKS
+#define HXCPP_GC_LAZY_SWEEP
 
 
 #ifndef __has_builtin
@@ -3152,8 +3152,11 @@ class GlobalAllocator
    enum { LOCAL_POOL_SIZE = 2 };
 
 public:
+   bool mLazySweepPending;
+
    GlobalAllocator()
    {
+      mLazySweepPending = false;
       memset((void *)mNextFreeBlockOfSize,0,sizeof(mNextFreeBlockOfSize));
       mRowsInUse = 0;
       mLargeAllocated = 0;
@@ -3164,6 +3167,7 @@ public:
       mCurrentRowsInUse = 0;
       mAllBlocksCount = 0;
       mGenerationalRetainEstimate = 0.5;
+      mSurvivalRate = 0.5;
       for(int p=0;p<LOCAL_POOL_SIZE;p++)
          mLocalPool[p] = 0;
 
@@ -3425,6 +3429,32 @@ public:
          for(int i=nextFreeBlock; i<mFreeBlocks.size(); i++)
          {
              BlockDataInfo *info = mFreeBlocks[i];
+
+             #ifdef HXCPP_GC_LAZY_SWEEP
+             if (!info->mReclaimed)
+             {
+                 if (info->mZeroLock) // Already being processed
+                    continue;
+
+                 // Try to claim for processing
+                 if (_hx_atomic_compare_exchange(&info->mZeroLock, 0, 1) != 0)
+                     continue;
+
+                 // Check again after lock
+                 if (info->mReclaimed)
+                 {
+                    info->mZeroLock = 0;
+                 }
+                 else
+                 {
+                     BlockDataStats dummy;
+                     dummy.clear();
+                     info->reclaim<false>(&dummy);
+                     info->mZeroLock = 0;
+                 }
+             }
+             #endif
+
              if (!info->mOwned && info->mMaxHoleSize>=inRequiredBytes)
              {
                 // Acquire the zero-lock
@@ -5456,6 +5486,22 @@ public:
 
    void reclaimBlocks(bool full, BlockDataStats &outStats)
    {
+      #ifdef HXCPP_GC_LAZY_SWEEP
+      if (!full)
+      {
+         mLazySweepPending = true;
+         outStats.clear();
+         // Just reset reclaimed flag
+         for(int i=0;i<mAllBlocks.size();i++)
+         {
+            mAllBlocks[i]->mReclaimed = false;
+         }
+         return;
+      }
+      #endif
+
+      mLazySweepPending = false;
+
       if (MAX_GC_THREADS>1)
       {
          for(int i=0;i<MAX_GC_THREADS;i++)
@@ -5506,6 +5552,29 @@ public:
    void createFreeList()
    {
       mFreeBlocks.clear();
+
+      #ifdef HXCPP_GC_LAZY_SWEEP
+      if (mLazySweepPending)
+      {
+         int extra = std::max( mAllBlocks.size(), 8<<IMMIX_BLOCK_GROUP_BITS);
+         mFreeBlocks.safeReserveExtra(extra);
+
+         for(int i=0;i<mAllBlocks.size();i++)
+         {
+             BlockDataInfo *info = mAllBlocks[i];
+             info->mOwned = false;
+             // Clear mZeroLock to allow racing threads to claim this block for sweeping
+             info->mZeroLock = 0;
+             mFreeBlocks.push(info);
+         }
+         
+         for(int i=0;i<BLOCK_OFSIZE_COUNT;i++)
+            mNextFreeBlockOfSize[i] = 0;
+            
+         mZeroList.clear();
+         return;
+      }
+      #endif
 
       for(int i=0;i<mAllBlocks.size();i++)
       {
@@ -6776,6 +6845,8 @@ size_t GlobalAllocator::MemGarbageEstimate()
       if (mLocalAllocs[i])
          total += mLocalAllocs[i]->GetAllocatedSinceGC();
    }
+   if (mSurvivalRate >= 1.0)
+      return 0;
    return (size_t)(total * (1.0 - mSurvivalRate));
 }
 
