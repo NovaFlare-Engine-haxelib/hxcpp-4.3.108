@@ -15,6 +15,12 @@
    #endif
 #endif
 
+#if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+   #include <emmintrin.h>
+#elif defined(__ARM_NEON) || defined(_M_ARM) || defined(_M_ARM64)
+   #include <arm_neon.h>
+#endif
+
 #include <string>
 #include <stdlib.h>
 
@@ -951,12 +957,74 @@ struct BlockDataInfo
       unsigned int *rowTotals = ((unsigned int *)rowMarked) + 1;
 
       // TODO - sse/neon
+      #if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+      // Process 128 bits (16 bytes) at a time
+      __m128i sum = _mm_setzero_si128();
+      unsigned char* ptr = (unsigned char*)rowTotals;
+      // We have 63 ints = 252 bytes. 252 / 16 = 15 chunks + 12 bytes
+      for(int i=0; i<15; i++) {
+         __m128i val = _mm_loadu_si128((__m128i*)(ptr + i*16));
+         // _mm_sad_epu8 calculates sum of absolute differences against 0 for each 8 bytes, result is 2 64-bit sums
+         sum = _mm_add_epi64(sum, _mm_sad_epu8(val, _mm_setzero_si128()));
+      }
+      unsigned int total = 0;
+      // Extract sums
+      total += _mm_cvtsi128_si32(sum) + _mm_cvtsi128_si32(_mm_srli_si128(sum, 8));
+      // Handle remaining 12 bytes
+      for(int i=240; i<252; i++) total += ptr[i];
+      
+      #ifdef HXCPP_GC_BIG_BLOCKS
+      // Another 256 bytes (64 ints)
+      // 256 / 16 = 16 chunks
+      sum = _mm_setzero_si128();
+      ptr = (unsigned char*)(rowTotals + 63);
+      for(int i=0; i<16; i++) {
+         __m128i val = _mm_loadu_si128((__m128i*)(ptr + i*16));
+         sum = _mm_add_epi64(sum, _mm_sad_epu8(val, _mm_setzero_si128()));
+      }
+      total += _mm_cvtsi128_si32(sum) + _mm_cvtsi128_si32(_mm_srli_si128(sum, 8));
+      #endif
+      
+      #elif defined(__ARM_NEON) || defined(_M_ARM) || defined(_M_ARM64)
+      // Process 128 bits (16 bytes) at a time
+      uint16x8_t sum_vec = vdupq_n_u16(0);
+      unsigned char* ptr = (unsigned char*)rowTotals;
+      // We have 63 ints = 252 bytes. 252 / 16 = 15 chunks + 12 bytes
+      for(int i=0; i<15; i++) {
+         uint8x16_t val = vld1q_u8(ptr + i*16);
+         // vpadalq_u8: Pairwise add and accumulate 8-bit integers into 16-bit integers
+         sum_vec = vpadalq_u8(sum_vec, val);
+      }
+      unsigned int total = 0;
+      // Horizontal sum the 8x16-bit vector
+      uint16_t tmp[8];
+      vst1q_u16(tmp, sum_vec);
+      for(int i=0; i<8; i++) total += tmp[i];
+      
+      // Handle remaining 12 bytes
+      for(int i=240; i<252; i++) total += ptr[i];
+
+      #ifdef HXCPP_GC_BIG_BLOCKS
+      // Another 256 bytes (64 ints)
+      // 256 / 16 = 16 chunks
+      sum_vec = vdupq_n_u16(0);
+      ptr = (unsigned char*)(rowTotals + 63);
+      for(int i=0; i<16; i++) {
+         uint8x16_t val = vld1q_u8(ptr + i*16);
+         sum_vec = vpadalq_u8(sum_vec, val);
+      }
+      vst1q_u16(tmp, sum_vec);
+      for(int i=0; i<8; i++) total += tmp[i];
+      #endif
+
+      #else
+      // Fallback to manual unrolling
       #ifdef HXCPP_GC_BIG_BLOCKS
       unsigned int total = 0;
       #else
       unsigned int total = rowMarked[2] + rowMarked[3];
       #endif
-
+      
       total +=
        rowTotals[0]  + rowTotals[1]  + rowTotals[2]  + rowTotals[3]  + rowTotals[4] +
        rowTotals[5]  + rowTotals[6]  + rowTotals[7]  + rowTotals[8]  + rowTotals[9] +
@@ -990,6 +1058,7 @@ struct BlockDataInfo
        rowTotals[55] + rowTotals[56] + rowTotals[57] + rowTotals[58] + rowTotals[59] +
        rowTotals[60] + rowTotals[61] + rowTotals[62] + rowTotals[63];
 
+      #endif
       #endif
 
       mUsedRows = (total & 0xff) + ((total>>8) & 0xff) + ((total>>16)&0xff) + ((total>>24)&0xff);
@@ -5051,10 +5120,20 @@ public:
          sgTimeToNextTableUpdate--;
 
       bool full = inMajor || (sgTimeToNextTableUpdate<=0) || inForceCompact;
+      
+      #ifdef HXCPP_GC_LAZY_SWEEP
+      if (!full)
+      {
+         // In lazy sweep mode, we skip countRows/reclaimBlocks unless forced
+         // This means stats will be empty/invalid, but that's expected for lazy sweep
+         // We only rely on heuristics based on block counts in lazy mode
+      }
+      #endif
 
       // Setup memory target ...
       // Count free rows, and prep blocks for sorting
       BlockDataStats stats;
+      stats.clear(); // Initialize stats
 
       /*
        This reduces the stall time, but adds a bit of background cpu usage
@@ -5062,6 +5141,7 @@ public:
       */
       if (!full && generational)
       {
+         #ifndef HXCPP_GC_LAZY_SWEEP
          countRows(stats);
          size_t currentRows = stats.rowsInUse + stats.fraggedRows + freeFraggedRows;
          double filled = (double)(currentRows) / (double)(mAllBlocks.size()*IMMIX_USEFUL_LINES);
@@ -5092,6 +5172,11 @@ public:
             stats.clear();
             reclaimBlocks(full,stats);
          }
+         #else
+         // In lazy sweep, we blindly trust generational mode until next full collect
+         // or until memory pressure forces a full collect via AllocMoreBlocks failure
+         reclaimBlocks(full,stats);
+         #endif
       }
       else
       {
@@ -5110,6 +5195,7 @@ public:
       #ifdef HXCPP_GC_MOVING
       if (!full)
       {
+         #ifndef HXCPP_GC_LAZY_SWEEP
          double useRatio = (double)(mRowsInUse<<IMMIX_LINE_BITS) / (sWorkingMemorySize);
          #if defined(SHOW_FRAGMENTATION) || defined(SHOW_MEM_EVENTS)
             GCLOG("Row use ratio:%f\n", useRatio);
@@ -5124,6 +5210,7 @@ public:
             stats.clear();
             reclaimBlocks(full,stats);
          }
+         #endif
       }
       #endif
 
@@ -5389,7 +5476,17 @@ public:
 
       // This saves some running/stall time, but increases the total CPU usage
       // Delaying it until just before the block is used to improve the cache locality
+      #ifdef HXCPP_GC_LAZY_SWEEP
+      // In lazy sweep, we definitely want background zeroing to reduce alloc latency
+      // and we don't need to rebuild the zero list because we pushed everything to free list
+      if (MAX_GC_THREADS>1)
+      {
+         // We already populated mZeroList in createFreeList, just start the job
+         StartThreadJobs(tpjAsyncZeroJit, mZeroList.size(), false, 1);
+      }
+      #else
       backgroundProcessFreeList(true);
+      #endif
 
       mAllBlocksCount   = mAllBlocks.size();
       mCurrentRowsInUse = mRowsInUse;
@@ -5491,10 +5588,23 @@ public:
       {
          mLazySweepPending = true;
          outStats.clear();
-         // Just reset reclaimed flag
-         for(int i=0;i<mAllBlocks.size();i++)
+         
+         // Use SIMD or unrolled loop for faster clearing if possible, 
+         // but for now standard unrolling is good enough.
+         int n = mAllBlocks.size();
+         // Process 4 at a time to reduce loop overhead
+         int i = 0;
+         for(; i <= n-4; i+=4)
          {
-            mAllBlocks[i]->mReclaimed = false;
+             mAllBlocks[i]->mReclaimed = false;
+             mAllBlocks[i+1]->mReclaimed = false;
+             mAllBlocks[i+2]->mReclaimed = false;
+             mAllBlocks[i+3]->mReclaimed = false;
+         }
+         // Handle remaining
+         for(; i < n; i++)
+         {
+             mAllBlocks[i]->mReclaimed = false;
          }
          return;
       }
@@ -5571,7 +5681,13 @@ public:
          for(int i=0;i<BLOCK_OFSIZE_COUNT;i++)
             mNextFreeBlockOfSize[i] = 0;
             
+         // In lazy sweep, populate mZeroList for background zeroing if threads available
          mZeroList.clear();
+         if (MAX_GC_THREADS>1)
+         {
+             mZeroList.setSize(mFreeBlocks.size());
+             memcpy( &mZeroList[0], &mFreeBlocks[0], mFreeBlocks.size()*sizeof(void *));
+         }
          return;
       }
       #endif
@@ -5796,6 +5912,9 @@ void MarkConservative(int *inBottom, int *inTop,hx::MarkContext *__inCtx)
 
    for(int *ptr = inBottom ; ptr<inTop; ptr++)
    {
+      #if defined(__GNUC__) || defined(__clang__)
+      __builtin_prefetch(ptr + 32); // Prefetch ahead
+      #endif
       void *vptr = *(void **)ptr;
 
       MemType mem;
