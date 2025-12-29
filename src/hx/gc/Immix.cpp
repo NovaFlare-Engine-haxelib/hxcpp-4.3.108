@@ -767,10 +767,6 @@ static int gBlockInfoEmptySlots = 0;
     #define ALIGN_PADDING(x) 0
 #endif
 
-#define HX_GC_STICKY_IMMIX
-// Sticky Immix logic - retain blocks if they contain enough live objects
-#define STICKY_RETAIN_THRESHOLD 0.75
-
 struct BlockDataInfo
 {
    int             mId;
@@ -794,24 +790,8 @@ struct BlockDataInfo
    #ifdef HXCPP_GC_GENERATIONAL
    bool         mHasSurvivor;
    #endif
-   bool         mSticky;
    volatile int mZeroLock;
 
-   // Sticky Immix: Keep blocks with high survival rate
-   void CheckStickyBlock(double inSurvivalRate)
-   {
-      if (inSurvivalRate > STICKY_RETAIN_THRESHOLD)
-      {
-         // Mark block as sticky - prefer not to sweep/recycle immediately
-         // This is a hint to the allocator to skip this block for new allocations
-         // if possible, preserving the surviving objects in place.
-         mSticky = true;
-      }
-      else
-      {
-         mSticky = false;
-      }
-   }
 
    BlockDataInfo(int inGid, BlockData *inData)
    {
@@ -837,7 +817,6 @@ struct BlockDataInfo
 
       mZeroLock = 0;
       mOwned = false;
-      mSticky = false;
       mGroupId = inGid;
       mPtr     = inData;
       inData->mId = mId;
@@ -864,7 +843,6 @@ struct BlockDataInfo
       mReclaimed = true;
       mZeroLock = 0;
       mOwned = false;
-      mSticky = false;
    }
 
    void makeFull()
@@ -984,9 +962,21 @@ struct BlockDataInfo
       __m128i sum = _mm_setzero_si128();
       unsigned char* ptr = (unsigned char*)rowTotals;
       // We have 63 ints = 252 bytes. 252 / 16 = 15 chunks + 12 bytes
-      for(int i=0; i<15; i++) {
+      // Unroll the loop 4x for better pipelining
+      int i=0;
+      for(; i<=12; i+=4) {
+         __m128i val0 = _mm_loadu_si128((__m128i*)(ptr + i*16));
+         __m128i val1 = _mm_loadu_si128((__m128i*)(ptr + (i+1)*16));
+         __m128i val2 = _mm_loadu_si128((__m128i*)(ptr + (i+2)*16));
+         __m128i val3 = _mm_loadu_si128((__m128i*)(ptr + (i+3)*16));
+         
+         sum = _mm_add_epi64(sum, _mm_sad_epu8(val0, _mm_setzero_si128()));
+         sum = _mm_add_epi64(sum, _mm_sad_epu8(val1, _mm_setzero_si128()));
+         sum = _mm_add_epi64(sum, _mm_sad_epu8(val2, _mm_setzero_si128()));
+         sum = _mm_add_epi64(sum, _mm_sad_epu8(val3, _mm_setzero_si128()));
+      }
+      for(; i<15; i++) {
          __m128i val = _mm_loadu_si128((__m128i*)(ptr + i*16));
-         // _mm_sad_epu8 calculates sum of absolute differences against 0 for each 8 bytes, result is 2 64-bit sums
          sum = _mm_add_epi64(sum, _mm_sad_epu8(val, _mm_setzero_si128()));
       }
       unsigned int total = 0;
@@ -1000,7 +990,20 @@ struct BlockDataInfo
       // 256 / 16 = 16 chunks
       sum = _mm_setzero_si128();
       ptr = (unsigned char*)(rowTotals + 63);
-      for(int i=0; i<16; i++) {
+      // Unroll 4x
+      i=0;
+      for(; i<=12; i+=4) {
+         __m128i val0 = _mm_loadu_si128((__m128i*)(ptr + i*16));
+         __m128i val1 = _mm_loadu_si128((__m128i*)(ptr + (i+1)*16));
+         __m128i val2 = _mm_loadu_si128((__m128i*)(ptr + (i+2)*16));
+         __m128i val3 = _mm_loadu_si128((__m128i*)(ptr + (i+3)*16));
+         
+         sum = _mm_add_epi64(sum, _mm_sad_epu8(val0, _mm_setzero_si128()));
+         sum = _mm_add_epi64(sum, _mm_sad_epu8(val1, _mm_setzero_si128()));
+         sum = _mm_add_epi64(sum, _mm_sad_epu8(val2, _mm_setzero_si128()));
+         sum = _mm_add_epi64(sum, _mm_sad_epu8(val3, _mm_setzero_si128()));
+      }
+      for(; i<16; i++) {
          __m128i val = _mm_loadu_si128((__m128i*)(ptr + i*16));
          sum = _mm_add_epi64(sum, _mm_sad_epu8(val, _mm_setzero_si128()));
       }
@@ -1012,31 +1015,55 @@ struct BlockDataInfo
       uint16x8_t sum_vec = vdupq_n_u16(0);
       unsigned char* ptr = (unsigned char*)rowTotals;
       // We have 63 ints = 252 bytes. 252 / 16 = 15 chunks + 12 bytes
-      for(int i=0; i<15; i++) {
+      // Unroll 4x
+      int i=0;
+      for(; i<=12; i+=4) {
+         uint8x16_t val0 = vld1q_u8(ptr + i*16);
+         uint8x16_t val1 = vld1q_u8(ptr + (i+1)*16);
+         uint8x16_t val2 = vld1q_u8(ptr + (i+2)*16);
+         uint8x16_t val3 = vld1q_u8(ptr + (i+3)*16);
+         
+         sum_vec = vpadalq_u8(sum_vec, val0);
+         sum_vec = vpadalq_u8(sum_vec, val1);
+         sum_vec = vpadalq_u8(sum_vec, val2);
+         sum_vec = vpadalq_u8(sum_vec, val3);
+      }
+      for(; i<15; i++) {
          uint8x16_t val = vld1q_u8(ptr + i*16);
-         // vpadalq_u8: Pairwise add and accumulate 8-bit integers into 16-bit integers
          sum_vec = vpadalq_u8(sum_vec, val);
       }
       unsigned int total = 0;
       // Horizontal sum the 8x16-bit vector
       uint16_t tmp[8];
       vst1q_u16(tmp, sum_vec);
-      for(int i=0; i<8; i++) total += tmp[i];
+      for(int j=0; j<8; j++) total += tmp[j];
       
       // Handle remaining 12 bytes
-      for(int i=240; i<252; i++) total += ptr[i];
+      for(int j=240; j<252; j++) total += ptr[j];
 
       #ifdef HXCPP_GC_BIG_BLOCKS
       // Another 256 bytes (64 ints)
       // 256 / 16 = 16 chunks
       sum_vec = vdupq_n_u16(0);
       ptr = (unsigned char*)(rowTotals + 63);
-      for(int i=0; i<16; i++) {
+      i=0;
+      for(; i<=12; i+=4) {
+         uint8x16_t val0 = vld1q_u8(ptr + i*16);
+         uint8x16_t val1 = vld1q_u8(ptr + (i+1)*16);
+         uint8x16_t val2 = vld1q_u8(ptr + (i+2)*16);
+         uint8x16_t val3 = vld1q_u8(ptr + (i+3)*16);
+         
+         sum_vec = vpadalq_u8(sum_vec, val0);
+         sum_vec = vpadalq_u8(sum_vec, val1);
+         sum_vec = vpadalq_u8(sum_vec, val2);
+         sum_vec = vpadalq_u8(sum_vec, val3);
+      }
+      for(; i<16; i++) {
          uint8x16_t val = vld1q_u8(ptr + i*16);
          sum_vec = vpadalq_u8(sum_vec, val);
       }
       vst1q_u16(tmp, sum_vec);
-      for(int i=0; i<8; i++) total += tmp[i];
+      for(int j=0; j<8; j++) total += tmp[j];
       #endif
 
       #else
@@ -1085,11 +1112,6 @@ struct BlockDataInfo
 
       mUsedRows = (total & 0xff) + ((total>>8) & 0xff) + ((total>>16)&0xff) + ((total>>24)&0xff);
       mUsedBytes = mUsedRows<<IMMIX_LINE_BITS;
-
-      // Sticky Immix: Check survival rate
-      #ifdef HX_GC_STICKY_IMMIX
-      CheckStickyBlock((double)mUsedRows / (double)IMMIX_USEFUL_LINES);
-      #endif
 
       mZeroLock = 0;
       mOwned = false;
@@ -3516,111 +3538,90 @@ public:
       int sizeSlot = inRequiredBytes>>IMMIX_LINE_BITS;
       if (sizeSlot>=BLOCK_OFSIZE_COUNT)
          sizeSlot = BLOCK_OFSIZE_COUNT-1;
-      
       //volatile int &nextFreeBlock = mNextFreeBlockOfSize[sizeSlot];
       int nextFreeBlock = mNextFreeBlockOfSize[sizeSlot];
-      int startSearch = nextFreeBlock;
-      
-      for(int pass=0; pass<2; pass++)
+      while(failedLock && nextFreeBlock<mFreeBlocks.size())
       {
-         bool allowSticky = (pass == 1);
-         
-         // Reset search for second pass
-         if (pass==1)
-            nextFreeBlock = 0;
+         failedLock = false;
 
-         while(failedLock && nextFreeBlock<mFreeBlocks.size())
+         for(int i=nextFreeBlock; i<mFreeBlocks.size(); i++)
          {
-            failedLock = false;
+             BlockDataInfo *info = mFreeBlocks[i];
 
-            for(int i=nextFreeBlock; i<mFreeBlocks.size(); i++)
-            {
-                BlockDataInfo *info = mFreeBlocks[i];
+             #ifdef HXCPP_GC_LAZY_SWEEP
+             if (!info->mReclaimed)
+             {
+                 if (info->mZeroLock) // Already being processed
+                    continue;
 
-                #ifdef HX_GC_STICKY_IMMIX
-                // Skip sticky blocks in first pass
-                if (info->mSticky && !allowSticky)
-                   continue;
-                #endif
-
-                #ifdef HXCPP_GC_LAZY_SWEEP
-               if (!info->mReclaimed)
-               {
-                  if (info->mZeroLock) // Already being processed
+                 // Try to claim for processing
+                 if (_hx_atomic_compare_exchange(&info->mZeroLock, 0, 1) != 0)
                      continue;
 
-                  // Try to claim for processing
-                  if (_hx_atomic_compare_exchange(&info->mZeroLock, 0, 1) != 0)
-                        continue;
-
-                  // Check again after lock
-                  if (info->mReclaimed)
-                  {
+                 // Check again after lock
+                 if (info->mReclaimed)
+                 {
+                    info->mZeroLock = 0;
+                 }
+                 else
+                 {
+                     BlockDataStats dummy;
+                     dummy.clear();
+                     info->reclaim<false>(&dummy);
                      info->mZeroLock = 0;
-                  }
-                  else
-                  {
-                        BlockDataStats dummy;
-                        dummy.clear();
-                        info->reclaim<false>(&dummy);
-                        info->mZeroLock = 0;
-                  }
-               }
-               #endif
+                 }
+             }
+             #endif
 
-               if (!info->mOwned && info->mMaxHoleSize>=inRequiredBytes)
-               {
-                  // Acquire the zero-lock
-                  if (_hx_atomic_compare_exchange(&info->mZeroLock, 0, 1) == 0)
-                  {
-                     // Acquire ownership...
-                     if (info->mOwned)
-                     {
-                        // Someone else got it...
-                        info->mZeroLock = 0;
-                     }
-                     else
-                     {
-                        info->mOwned = true;
+             if (!info->mOwned && info->mMaxHoleSize>=inRequiredBytes)
+             {
+                // Acquire the zero-lock
+                if (_hx_atomic_compare_exchange(&info->mZeroLock, 0, 1) == 0)
+                {
+                   // Acquire ownership...
+                   if (info->mOwned)
+                   {
+                      // Someone else got it...
+                      info->mZeroLock = 0;
+                   }
+                   else
+                   {
+                      info->mOwned = true;
 
-                        // Increase the mNextFreeBlockOfSize
-                        int idx = nextFreeBlock;
-                        while(idx<mFreeBlocks.size() && mFreeBlocks[idx]->mOwned)
-                        {
-                           _hx_atomic_compare_exchange(mNextFreeBlockOfSize+sizeSlot, idx, idx+1);
-                           idx++;
-                        }
+                      // Increase the mNextFreeBlockOfSize
+                      int idx = nextFreeBlock;
+                      while(idx<mFreeBlocks.size() && mFreeBlocks[idx]->mOwned)
+                      {
+                         _hx_atomic_compare_exchange(mNextFreeBlockOfSize+sizeSlot, idx, idx+1);
+                         idx++;
+                      }
 
-                        if (sgThreadPoolJob==tpjAsyncZeroJit)
-                        {
-                           if (info->mZeroed==ZEROED_THREAD)
-                              onZeroedBlockDequeued();
-                           #ifdef PROFILE_THREAD_USAGE
-                           else
-                           {
-                              if (!info->mZeroed)
-                                 _hx_atomic_add(&sThreadZeroMisses, 1);
-                           }
-                           #endif
-                        }
+                      if (sgThreadPoolJob==tpjAsyncZeroJit)
+                      {
+                         if (info->mZeroed==ZEROED_THREAD)
+                            onZeroedBlockDequeued();
+                         #ifdef PROFILE_THREAD_USAGE
+                         else
+                         {
+                            if (!info->mZeroed)
+                               _hx_atomic_add(&sThreadZeroMisses, 1);
+                         }
+                         #endif
+                       }
 
-                        return info;
-                     }
-                  }
-                  else if (!info->mOwned)
-                  {
-                     // Zeroing thread is currently working on this block
-                     // Go to next one or spin around again
-                     // In multi-pass, we just keep going
-                     // failedLock = true; 
-                  }
-               }
-            }
+                      return info;
+                   }
+                 }
+                 else if (!info->mOwned)
+                 {
+                    // Zeroing thread is currently working on this block
+                    // Go to next one or spin around again
+                    failedLock = true;
+                 }
+             }
          }
-         
-         // If we found nothing in Pass 0, we loop to Pass 1.
-         // If we found nothing in Pass 1, we exit with failure.
       }
+
       return 0;
    }
 
@@ -5905,7 +5906,7 @@ public:
    hx::QuickVec<unsigned int *> largeObjectRecycle;
 };
 
-// GlobalAllocator definition ends here.
+
 
 namespace hx
 {
